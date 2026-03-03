@@ -7,7 +7,10 @@ import { useState, useEffect, useCallback, useRef } from "react";
 const SUPABASE_URL = "https://nwgefqvjlhtjovafxrhk.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_Yie9ZU8n6MWUxdeHP4clDw_MxKY3Qlc";
 
-// Lightweight Supabase client using REST API directly (no SDK needed in artifact)
+const STRIPE_PAYMENT_LINK = "https://buy.stripe.com/5kQ8wP2qJ62Y3g2eWt5AQ00";
+const APP_URL = "https://todo-app-beta-five-35.vercel.app";
+const FREE_TASK_LIMIT = 3;
+
 function supabase(token) {
   const headers = {
     apikey: SUPABASE_ANON_KEY,
@@ -40,7 +43,6 @@ function supabase(token) {
   };
 }
 
-// Supabase Auth via REST
 async function supabaseAuth(action, payload) {
   const endpoints = {
     signup: "/auth/v1/signup",
@@ -77,6 +79,7 @@ const COLORS = {
   orange: "#ff8c42",
   green: "#4caf82",
   pink: "#ff6b9d",
+  gold: "#FFD700",
 };
 
 // ═══════════════════════════════════════════
@@ -84,15 +87,17 @@ const COLORS = {
 // ═══════════════════════════════════════════
 
 export default function App() {
-  const [session, setSession] = useState(null); // { access_token, refresh_token, user }
+  const [session, setSession] = useState(null);
   const [authScreen, setAuthScreen] = useState("login");
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
   const [checkingAuth, setCheckingAuth] = useState(true);
 
-  // Restore session from localStorage
   useEffect(() => {
     (async () => {
+      const params = new URLSearchParams(window.location.search);
+      const stripeSuccess = params.get("stripe_success");
+
       try {
         const raw = localStorage.getItem("todo-session");
         if (raw) {
@@ -102,6 +107,11 @@ export default function App() {
             const newSession = { access_token: refreshed.access_token, refresh_token: refreshed.refresh_token, user: refreshed.user };
             setSession(newSession);
             localStorage.setItem("todo-session", JSON.stringify(newSession));
+
+            if (stripeSuccess === "1") {
+              await upgradeToPro(newSession.access_token, newSession.user.id);
+              window.history.replaceState({}, "", window.location.pathname);
+            }
           } catch {
             localStorage.removeItem("todo-session");
           }
@@ -110,6 +120,20 @@ export default function App() {
       setCheckingAuth(false);
     })();
   }, []);
+
+  async function upgradeToPro(token, userId) {
+    const db = supabase(token);
+    try {
+      const existing = await db.from("profiles").select("*", `user_id=eq.${userId}`);
+      if (existing && existing.length > 0) {
+        await db.from("profiles").update({ tier: "pro" }, `user_id=eq.${userId}`);
+      } else {
+        await db.from("profiles").insert({ user_id: userId, tier: "pro" });
+      }
+    } catch (e) {
+      console.error("Failed to upgrade tier:", e);
+    }
+  }
 
   function saveSession(sess) {
     setSession(sess);
@@ -164,14 +188,14 @@ export default function App() {
     );
   }
 
-  return <MainApp session={session} onLogout={logout} />;
+  return <MainApp session={session} onLogout={logout} upgradeToPro={upgradeToPro} />;
 }
 
 // ═══════════════════════════════════════════
 //  MAIN APP (AUTHENTICATED)
 // ═══════════════════════════════════════════
 
-function MainApp({ session, onLogout }) {
+function MainApp({ session, onLogout, upgradeToPro }) {
   const db = supabase(session.access_token);
   const user = session.user;
   const userName = user?.user_metadata?.name || user?.email?.split("@")[0] || "there";
@@ -193,6 +217,7 @@ function MainApp({ session, onLogout }) {
   const [animating, setAnimating] = useState(false);
   const [editTask, setEditTask] = useState(null);
   const [editSubtask, setEditSubtask] = useState("");
+  const [userTier, setUserTier] = useState("free");
   const screenKey = useRef(0);
 
   const PAGE_ORDER = { home: 0, listDetail: 0.5, tasks: 1, settings: 2 };
@@ -215,12 +240,23 @@ function MainApp({ session, onLogout }) {
     setTimeout(() => setSaveStatus("idle"), status === "error" ? 3000 : 1500);
   }
 
-  // ─── Fetch all lists with tasks and subtasks ───
+  async function fetchUserTier() {
+    try {
+      const profiles = await db.from("profiles").select("*", `user_id=eq.${user.id}`);
+      if (profiles && profiles.length > 0) {
+        setUserTier(profiles[0].tier || "free");
+      } else {
+        await db.from("profiles").insert({ user_id: user.id, tier: "free" });
+        setUserTier("free");
+      }
+    } catch (e) {
+      console.error("Failed to fetch tier:", e);
+    }
+  }
+
   async function fetchLists() {
     try {
       const listsData = await db.from("lists").select("*", `user_id=eq.${user.id}&order=position.asc`);
-      const taskIds = [];
-      // Fetch tasks for all lists
       const listIds = listsData.map(l => l.id);
       let tasksData = [];
       let subtasksData = [];
@@ -233,7 +269,6 @@ function MainApp({ session, onLogout }) {
         }
       }
 
-      // Assemble nested structure
       const assembled = listsData.map(l => ({
         ...l,
         desc: l.description,
@@ -255,13 +290,16 @@ function MainApp({ session, onLogout }) {
 
   useEffect(() => {
     (async () => {
-      await fetchLists();
+      await Promise.all([fetchLists(), fetchUserTier()]);
       setIsLoading(false);
     })();
   }, []);
 
-  // ─── Derived data ───
   const allTasks = lists.flatMap((l) => l.tasks.map((t) => ({ ...t, listName: l.name, listColor: l.color, listId: l.id })));
+  const totalTaskCount = allTasks.length;
+  const isPro = userTier === "pro";
+  const isAtLimit = !isPro && totalTaskCount >= FREE_TASK_LIMIT;
+
   const dueTodayCount = allTasks.filter((t) => !t.done && (t.dueDate?.includes("Today") || t.dueDate === "Tomorrow")).length;
   const overdueCount = allTasks.filter((t) => t.overdue && !t.done).length;
 
@@ -270,14 +308,14 @@ function MainApp({ session, onLogout }) {
     ...allTasks.filter(t => !t.done && t.dueDate?.includes("Today")).map(t => ({ id: `d-${t.id}`, type: "due", message: `${t.name} due ${t.dueDate}`, list: t.listName })),
   ];
 
-  // ═══════════════════════════════════════════
-  //  SUPABASE CRUD OPERATIONS
-  // ═══════════════════════════════════════════
+  function handleUpgradeClick() {
+    const successUrl = `${APP_URL}?stripe_success=1`;
+    window.open(`${STRIPE_PAYMENT_LINK}?success_url=${encodeURIComponent(successUrl)}`, "_blank");
+  }
 
   async function toggleTask(listId, taskId) {
     const task = allTasks.find(t => t.id === taskId);
     if (!task) return;
-    // Optimistic
     setLists(prev => prev.map(l => l.id === listId ? { ...l, tasks: l.tasks.map(t => t.id === taskId ? { ...t, done: !t.done } : t) } : l));
     try {
       await db.from("tasks").update({ done: !task.done }, `id=eq.${taskId}`);
@@ -320,7 +358,6 @@ function MainApp({ session, onLogout }) {
     setLists(prev => prev.filter(l => l.id !== listId));
     navigateTo("home");
     try {
-      // Cascade: delete subtasks → tasks → list
       const tasks = allTasks.filter(t => t.listId === listId);
       for (const t of tasks) {
         await db.from("subtasks").delete(`task_id=eq.${t.id}`);
@@ -333,6 +370,7 @@ function MainApp({ session, onLogout }) {
 
   async function addTask() {
     if (!newTask.name.trim()) return;
+    if (isAtLimit) { setShowCreateTask(false); return; }
     const targetListId = newTask.listId || lists[0]?.id;
     if (!targetListId) return;
     setShowCreateTask(false);
@@ -399,7 +437,6 @@ function MainApp({ session, onLogout }) {
       if (targetListId !== origListId) updateData.list_id = targetListId;
       await db.from("tasks").update(updateData, `id=eq.${t.id}`);
 
-      // Sync subtasks
       const origTask = lists.flatMap(l => l.tasks).find(tt => tt.id === t.id);
       const origSubs = origTask?.subtasks || [];
       const editSubs = t.subtasks;
@@ -490,8 +527,34 @@ function MainApp({ session, onLogout }) {
     <PhoneFrame>
       <GlobalStyles />
 
+      {/* ── UPGRADE BANNER ── */}
+      {isAtLimit && screen !== "settings" && (
+        <div style={{
+          position: "absolute", top: 0, left: 0, right: 0, zIndex: 40,
+          background: "linear-gradient(90deg, #6C63FF, #ff6b9d)",
+          padding: "10px 16px",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          borderRadius: "40px 40px 0 0",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 16 }}>⚡</span>
+            <div>
+              <div style={{ color: "white", fontWeight: 700, fontSize: 12 }}>Free limit reached (3 tasks)</div>
+              <div style={{ color: "rgba(255,255,255,0.8)", fontSize: 11 }}>Upgrade for unlimited tasks</div>
+            </div>
+          </div>
+          <button onClick={handleUpgradeClick} style={{
+            background: "white", color: COLORS.primary, border: "none",
+            borderRadius: 20, padding: "6px 14px", fontWeight: 800, fontSize: 12, cursor: "pointer",
+            whiteSpace: "nowrap", flexShrink: 0,
+          }}>
+            Go Pro · $2
+          </button>
+        </div>
+      )}
+
       {saveStatus !== "idle" && (
-        <div className="save-indicator" style={{ position: "absolute", top: 28, left: "50%", transform: "translateX(-50%)", zIndex: 50, background: saveStatus === "error" ? COLORS.red + "cc" : saveStatus === "saved" ? COLORS.green + "cc" : COLORS.surface + "ee", padding: "5px 14px", borderRadius: 20, display: "flex", alignItems: "center", gap: 6, backdropFilter: "blur(8px)" }}>
+        <div className="save-indicator" style={{ position: "absolute", top: isAtLimit ? 52 : 28, left: "50%", transform: "translateX(-50%)", zIndex: 50, background: saveStatus === "error" ? COLORS.red + "cc" : saveStatus === "saved" ? COLORS.green + "cc" : COLORS.surface + "ee", padding: "5px 14px", borderRadius: 20, display: "flex", alignItems: "center", gap: 6, backdropFilter: "blur(8px)" }}>
           <span style={{ fontSize: 11 }}>{saveStatus === "saving" ? "💾" : saveStatus === "saved" ? "✓" : "⚠"}</span>
           <span style={{ fontSize: 11, fontWeight: 600, color: COLORS.text }}>{saveStatus === "saving" ? "Saving..." : saveStatus === "saved" ? "Saved" : "Save failed"}</span>
         </div>
@@ -500,12 +563,17 @@ function MainApp({ session, onLogout }) {
       {/* ── HOME ── */}
       {screen === "home" && !showNotifications && (
         <div className={slideClass} key={screenKey.current + '-page'} style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-          <div style={{ flex: 1, overflowY: "auto", padding: "56px 20px 12px" }}>
+          <div style={{ flex: 1, overflowY: "auto", padding: `${isAtLimit ? 72 : 56}px 20px 12px` }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 24 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                 <div style={{ width: 44, height: 44, borderRadius: "50%", background: COLORS.green, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 16, color: "white" }}>{userName[0]?.toUpperCase()}</div>
                 <div>
-                  <div style={{ fontWeight: 800, fontSize: 18, color: COLORS.text }}>Hello, {userName}!</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ fontWeight: 800, fontSize: 18, color: COLORS.text }}>Hello, {userName}!</div>
+                    {isPro && (
+                      <span style={{ background: "linear-gradient(90deg, #6C63FF, #ff6b9d)", color: "white", fontSize: 9, fontWeight: 800, padding: "2px 8px", borderRadius: 20, textTransform: "uppercase", letterSpacing: 0.5 }}>PRO</span>
+                    )}
+                  </div>
                   <div style={{ color: COLORS.textSecondary, fontSize: 13, marginTop: 2 }}>Ready to conquer the day? 🚀</div>
                 </div>
               </div>
@@ -514,6 +582,18 @@ function MainApp({ session, onLogout }) {
                 {notifications.length > 0 && <div style={{ position: "absolute", top: 8, right: 8, width: 8, height: 8, background: COLORS.red, borderRadius: "50%" }} />}
               </button>
             </div>
+
+            {/* Free tier task counter */}
+            {!isPro && (
+              <div style={{ background: COLORS.surface, borderRadius: 14, padding: "10px 16px", marginBottom: 16, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ fontSize: 13, color: COLORS.textSecondary, fontWeight: 600 }}>Free plan · {totalTaskCount}/{FREE_TASK_LIMIT} tasks</div>
+                <div style={{ display: "flex", gap: 4 }}>
+                  {[0,1,2].map(i => (
+                    <div key={i} style={{ width: 28, height: 6, borderRadius: 4, background: i < totalTaskCount ? COLORS.primary : COLORS.surfaceLight }} />
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 24 }}>
               <div style={{ background: "linear-gradient(135deg, #2a2a50, #1e1e38)", borderRadius: 16, padding: "16px 20px" }}>
@@ -615,7 +695,7 @@ function MainApp({ session, onLogout }) {
       {/* ── LIST DETAIL ── */}
       {screen === "listDetail" && currentList && (
         <div className={slideClass} key={screenKey.current + '-page'} style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-          <div style={{ background: "linear-gradient(160deg, #4a3fff, #6C63FF)", padding: "56px 20px 24px", borderRadius: "0 0 28px 28px", position: "relative", overflow: "hidden" }}>
+          <div style={{ background: "linear-gradient(160deg, #4a3fff, #6C63FF)", padding: `${isAtLimit ? 72 : 56}px 20px 24px`, borderRadius: "0 0 28px 28px", position: "relative", overflow: "hidden" }}>
             <div style={{ position: "absolute", top: -20, right: -20, width: 120, height: 120, borderRadius: "50%", background: "rgba(255,255,255,0.07)" }} />
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <button onClick={() => navigateTo("home")} style={{ background: "rgba(255,255,255,0.15)", border: "none", borderRadius: 12, width: 36, height: 36, display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 16, cursor: "pointer" }}>←</button>
@@ -636,7 +716,16 @@ function MainApp({ session, onLogout }) {
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
               <div style={{ fontWeight: 700, fontSize: 17, color: COLORS.text }}>Tasks</div>
-              <button onClick={() => { setShowCreateTask(true); setNewTask(p => ({ ...p, listId: currentList.id })); }} style={{ background: "none", border: `1.5px dashed ${COLORS.primary}`, borderRadius: 10, padding: "6px 14px", color: COLORS.primary, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>+ Add Task</button>
+              <button
+                onClick={() => {
+                  if (isAtLimit) { handleUpgradeClick(); return; }
+                  setShowCreateTask(true);
+                  setNewTask(p => ({ ...p, listId: currentList.id }));
+                }}
+                style={{ background: "none", border: `1.5px dashed ${isAtLimit ? COLORS.orange : COLORS.primary}`, borderRadius: 10, padding: "6px 14px", color: isAtLimit ? COLORS.orange : COLORS.primary, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+              >
+                {isAtLimit ? "⚡ Upgrade to Add" : "+ Add Task"}
+              </button>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {filteredTasks?.map(task => (<TaskCard key={task.id} task={task} listId={currentList.id} onToggle={toggleTask} onToggleSub={toggleSubtask} onDelete={deleteTask} onEdit={openEditTask} onAddSubtask={addSubtaskToTask} colors={COLORS} />))}
@@ -650,10 +739,15 @@ function MainApp({ session, onLogout }) {
       {/* ── ALL TASKS ── */}
       {screen === "tasks" && (
         <div className={slideClass} key={screenKey.current + '-page'} style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-          <div style={{ flex: 1, overflowY: "auto", padding: "56px 20px 12px" }}>
+          <div style={{ flex: 1, overflowY: "auto", padding: `${isAtLimit ? 72 : 56}px 20px 12px` }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
               <div style={{ fontWeight: 800, fontSize: 24, color: COLORS.text }}>All Tasks</div>
-              <button onClick={() => setShowCreateTask(true)} style={{ background: COLORS.primary, border: "none", borderRadius: 12, padding: "8px 16px", color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>+ New Task</button>
+              <button
+                onClick={() => { if (isAtLimit) { handleUpgradeClick(); return; } setShowCreateTask(true); }}
+                style={{ background: isAtLimit ? COLORS.orange + "22" : COLORS.primary, border: "none", borderRadius: 12, padding: "8px 16px", color: isAtLimit ? COLORS.orange : "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+              >
+                {isAtLimit ? "⚡ Upgrade" : "+ New Task"}
+              </button>
             </div>
             <div style={{ display: "flex", gap: 8, marginBottom: 20, background: COLORS.surface, padding: 4, borderRadius: 16 }}>
               {["All Tasks", "Incomplete", "Completed"].map(tab => (<button key={tab} className={`tab-btn ${activeTab === tab ? "active" : ""}`} onClick={() => setActiveTab(tab)} style={{ flex: 1 }}>{tab}</button>))}
@@ -684,14 +778,84 @@ function MainApp({ session, onLogout }) {
         <div className={slideClass} key={screenKey.current + '-page'} style={{ height: "100%", display: "flex", flexDirection: "column" }}>
           <div style={{ flex: 1, overflowY: "auto", padding: "56px 20px 12px" }}>
             <div style={{ fontWeight: 800, fontSize: 24, color: COLORS.text, marginBottom: 28 }}>Settings</div>
+
             <div style={{ background: "linear-gradient(135deg, #4a3fff22, #6C63FF11)", border: `1px solid ${COLORS.primary}33`, borderRadius: 20, padding: 20, marginBottom: 24, display: "flex", alignItems: "center", gap: 16 }}>
               <div style={{ width: 60, height: 60, borderRadius: "50%", background: COLORS.green, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 22, color: "white" }}>{userName[0]?.toUpperCase()}</div>
               <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 800, fontSize: 18, color: COLORS.text }}>{userName}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+                  <div style={{ fontWeight: 800, fontSize: 18, color: COLORS.text }}>{userName}</div>
+                  {isPro && <span style={{ background: "linear-gradient(90deg, #6C63FF, #ff6b9d)", color: "white", fontSize: 9, fontWeight: 800, padding: "2px 8px", borderRadius: 20, textTransform: "uppercase" }}>PRO</span>}
+                </div>
                 <div style={{ color: COLORS.textSecondary, fontSize: 13 }}>{user?.email}</div>
                 <div style={{ marginTop: 6 }}><span style={{ color: COLORS.textMuted, fontSize: 11 }}>{allTasks.length} tasks across {lists.length} lists</span></div>
               </div>
             </div>
+
+            {/* ── PLAN & BILLING ── */}
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, color: COLORS.textMuted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 10 }}>Plan & Billing</div>
+              {isPro ? (
+                <div style={{ background: "linear-gradient(135deg, #6C63FF18, #ff6b9d12)", border: `1px solid ${COLORS.primary}44`, borderRadius: 18, padding: 20 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                    <div style={{ width: 44, height: 44, borderRadius: 12, background: "linear-gradient(135deg, #6C63FF, #ff6b9d)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>⚡</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: 800, fontSize: 16, color: COLORS.text }}>Pro Plan</div>
+                      <div style={{ color: COLORS.textSecondary, fontSize: 13, marginTop: 2 }}>Unlimited tasks · $2 one-time</div>
+                    </div>
+                    <div style={{ background: COLORS.green + "22", color: COLORS.green, fontSize: 11, fontWeight: 800, padding: "4px 10px", borderRadius: 20 }}>Active ✓</div>
+                  </div>
+                  <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${COLORS.primary}22` }}>
+                    <div style={{ color: COLORS.textMuted, fontSize: 12 }}>✓ Unlimited tasks &nbsp;·&nbsp; ✓ Unlimited subtasks &nbsp;·&nbsp; ✓ All features</div>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ background: COLORS.card, borderRadius: 18, overflow: "hidden" }}>
+                  <div style={{ padding: "16px 18px", borderBottom: `1px solid ${COLORS.surface}` }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                        <div style={{ width: 34, height: 34, borderRadius: 10, background: COLORS.surface, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>🆓</div>
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: 15, color: COLORS.text }}>Free Plan</div>
+                          <div style={{ color: COLORS.textMuted, fontSize: 12, marginTop: 1 }}>{totalTaskCount}/{FREE_TASK_LIMIT} tasks used</div>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        {[0,1,2].map(i => (
+                          <div key={i} style={{ width: 20, height: 5, borderRadius: 3, background: i < totalTaskCount ? COLORS.primary : COLORS.surfaceLight }} />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ padding: 18 }}>
+                    <div style={{ display: "flex", alignItems: "flex-start", gap: 14, marginBottom: 16 }}>
+                      <div style={{ width: 44, height: 44, borderRadius: 12, background: "linear-gradient(135deg, #6C63FF, #ff6b9d)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0 }}>⚡</div>
+                      <div>
+                        <div style={{ fontWeight: 800, fontSize: 16, color: COLORS.text }}>Upgrade to Pro</div>
+                        <div style={{ color: COLORS.textSecondary, fontSize: 13, marginTop: 3, lineHeight: 1.5 }}>Unlock unlimited tasks for just $2. One-time payment, yours forever.</div>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+                      {["Unlimited tasks (free plan capped at 3)", "Unlimited lists & subtasks", "All future features included"].map((feat, i) => (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <div style={{ width: 18, height: 18, borderRadius: "50%", background: COLORS.primary + "22", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                            <span style={{ color: COLORS.primary, fontSize: 10, fontWeight: 800 }}>✓</span>
+                          </div>
+                          <span style={{ color: COLORS.textSecondary, fontSize: 13 }}>{feat}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <button
+                      onClick={handleUpgradeClick}
+                      style={{ width: "100%", background: "linear-gradient(90deg, #6C63FF, #8B85FF)", color: "white", border: "none", borderRadius: 14, padding: "14px 0", fontWeight: 800, fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
+                    >
+                      <span>⚡</span> Upgrade Now · $2
+                    </button>
+                    <div style={{ textAlign: "center", marginTop: 8, color: COLORS.textMuted, fontSize: 11 }}>Secure payment via Stripe</div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {[
               { title: "Data", items: [
                 { icon: "🗑️", label: "Clear Completed", action: "clearCompleted" },
@@ -702,7 +866,7 @@ function MainApp({ session, onLogout }) {
               ]},
               { title: "About", items: [
                 { icon: "☁️", label: "Backend", value: "Supabase" },
-                { icon: "ℹ️", label: "Version", value: "3.0.0" },
+                { icon: "ℹ️", label: "Version", value: "3.1.0" },
               ]},
             ].map(section => (
               <div key={section.title} style={{ marginBottom: 20 }}>
